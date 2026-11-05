@@ -15,18 +15,30 @@
  *   node scan-interamt.mjs --dry-run
  *   node scan-interamt.mjs --all            # skip date filter (use for first scan)
  *   node scan-interamt.mjs --keyword "Softwareentwickler"
+ *   node scan-interamt.mjs --debug          # save a screenshot and the page HTML to output/
  */
 
 import { chromium } from 'playwright';
 import { readFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import * as yaml from 'js-yaml';
-import { appendToPipeline, appendToScanHistory, loadSeenUrls } from './scan.mjs';
+import { appendToPipeline, appendToScanHistory, loadSeenUrls, PORTALS_PATH, SCAN_HISTORY_PATH } from './scan.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 import { localToday } from './lib/local-today.mjs';
+import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 
 // ── Config ───────────────────────────────────────────────────────────
 
-const PORTALS_PATH    = 'portals.yml';
-const SCAN_HISTORY    = 'data/scan-history.tsv';
+// Both imported from scan.mjs (#3510). This scanner appends through
+// scan.mjs's appendToScanHistory — anchored to the data root — while reading its
+// own bare-relative copy to work out the last scan date, so within a single run
+// it could write one history file and read another. Its portals copy also
+// ignored CAREER_OPS_PORTALS, which #2271 added so a second search lane does not
+// poison the first one's dedup history.
+const SCAN_HISTORY    = SCAN_HISTORY_PATH;
+const DATA_ROOT       = getCareerOpsRoot();
 const INTERAMT_HOME   = 'https://interamt.de/koop/app/';
 // Direct offer URL — constructed from StellenangebotId.
 // Wicket adds a session version number (?28&id=...) during live navigation,
@@ -47,16 +59,32 @@ const DEFAULT_KEYWORDS = [
 
 // ── Args ─────────────────────────────────────────────────────────────
 
+// Checked by validateFlags() in the main-module block below, before main()
+// runs (#4599). Without it, --help or a mistyped --dryrun fell through to a
+// live scan that appended to data/pipeline.md.
+const KNOWN_FLAGS = ['--dry-run', '--debug', '--all', '--keyword', '--help', '-h'];
+const VALUE_FLAGS = ['--keyword'];
+
+const USAGE = `Usage:
+  node scan-interamt.mjs
+  node scan-interamt.mjs --dry-run
+  node scan-interamt.mjs --all            # skip date filter (use for first scan)
+  node scan-interamt.mjs --keyword "Softwareentwickler"
+  node scan-interamt.mjs --debug          # save a screenshot and the page HTML to output/
+  node scan-interamt.mjs --help|-h        # print this usage block and exit`;
+
 const args = process.argv.slice(2);
 const DRY_RUN    = args.includes('--dry-run');
 const DEBUG      = args.includes('--debug');
 const NO_DATE_FILTER = args.includes('--all');
-const kwIdx = args.indexOf('--keyword');
-if (kwIdx !== -1 && (args[kwIdx + 1] === undefined || args[kwIdx + 1].startsWith('--'))) {
+// flagValue/hasFlag rather than indexOf: validateFlags accepts --keyword=value
+// for a value flag, and indexOf() cannot see that form, so the scan would run
+// every keyword instead of the one asked for.
+const SINGLE_KEYWORD = flagValue(args, '--keyword') ?? null;
+if (hasFlag(args, '--keyword') && (!SINGLE_KEYWORD || SINGLE_KEYWORD.startsWith('--'))) {
   console.error('Error: --keyword requires a value, e.g. --keyword "Softwareentwickler"');
   process.exit(1);
 }
-const SINGLE_KEYWORD = kwIdx !== -1 ? args[kwIdx + 1] : null;
 
 // ── Load portals.yml ─────────────────────────────────────────────────
 
@@ -204,12 +232,17 @@ async function searchInteramt(page, keyword, isFirst) {
   ]).catch(() => null);
 
   if (DEBUG) {
-    mkdirSync('output', { recursive: true });
-    await page.screenshot({ path: 'output/debug-interamt.png', fullPage: true });
+    // output/ is User Layer, so the debug dump follows the data root rather than
+    // appearing in whatever directory the scan was launched from (#3510).
+    const debugDir = join(DATA_ROOT, 'output');
+    const debugPng = join(debugDir, 'debug-interamt.png');
+    const debugHtml = join(debugDir, 'debug-interamt.html');
+    mkdirSync(debugDir, { recursive: true });
+    await page.screenshot({ path: debugPng, fullPage: true });
     const { writeFileSync: wf } = await import('fs');
-    wf('output/debug-interamt.html', await page.content());
-    console.log('  [debug] screenshot → output/debug-interamt.png');
-    console.log('  [debug] html       → output/debug-interamt.html');
+    wf(debugHtml, await page.content());
+    console.log(`  [debug] screenshot → ${debugPng}`);
+    console.log(`  [debug] html       → ${debugHtml}`);
     console.log('  [debug] url:', page.url());
     const rowCount = await page.$$eval('tr', rows => rows.length);
     console.log(`  [debug] total <tr> on page: ${rowCount}`);
@@ -255,7 +288,7 @@ async function searchInteramt(page, keyword, isFirst) {
 // ── Main ─────────────────────────────────────────────────────────────
 
 async function main() {
-  mkdirSync('data', { recursive: true });
+  mkdirSync(join(DATA_ROOT, 'data'), { recursive: true });
 
   const { seen } = loadSeenUrls();
   const date = localToday();
@@ -330,9 +363,7 @@ async function main() {
   }
 
   // Summary
-  console.log(`\n${'━'.repeat(45)}`);
-  console.log(`Interamt Scan — ${date}`);
-  console.log(`${'━'.repeat(45)}`);
+  printScanSummaryHeader('Interamt Scan', date);
   console.log(`Keywords searched:  ${keywords.length}`);
   console.log(`Total found:        ${totalFound}`);
   console.log(`Filtered by title:  ${titleSkipped.length}`);
@@ -361,7 +392,16 @@ async function main() {
   console.log('\n→ Run /career-ops pipeline to evaluate new offers.');
 }
 
-main().catch(err => {
-  console.error('Fatal:', err.message);
-  process.exit(1);
-});
+// Guarded like every sibling scanner (scan-hn.mjs:122, scan-ats-full.mjs:1115).
+// Unguarded, merely IMPORTING this module drove a live browser scan of
+// interamt.de and appended its results to the user's pipeline and scan history —
+// so the file could not be imported by a test, or by anything else, without
+// doing that. A module should not scan the internet as a side effect of being
+// loaded (#3510).
+if (isMainModule(import.meta.url)) {
+  validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
+  main().catch(err => {
+    console.error('Fatal:', err.message);
+    process.exit(1);
+  });
+}

@@ -22,9 +22,25 @@
  *   Smaller models (llama3.2:3b, phi3) may produce incomplete evaluations.
  */
 
-import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { localToday } from './lib/local-today.mjs';
+import { TSV_ADDITION_HEADER } from './tracker-parse.mjs';
+import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
+import {
+  formatReportNumber, releaseReportNumbers, reserveReportNumbers,
+} from './reserve-report-num.mjs';
+import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
+import { buildBudgetedPrompt } from './lib/context-budget.mjs';
+import {
+  isPostingUrl, normalizedTrackerScore, slugifyCompany, tsvSafe,
+} from './lib/tracker-addition.mjs';
+
+const tracker = new TokenAccumulator();
+tracker.recordZeroToken('scan');
+tracker.recordZeroToken('pdf payload');
 
 try {
   const { config } = await import('dotenv');
@@ -32,6 +48,7 @@ try {
 } catch { /* dotenv optional */ }
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
+const DATA_ROOT = getCareerOpsRoot();
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -39,8 +56,16 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const PATHS = {
   shared:  join(ROOT, 'modes', '_shared.md'),
   oferta:  join(ROOT, 'modes', 'oferta.md'),
-  cv:      join(ROOT, 'cv.md'),
-  reports: join(ROOT, 'reports'),
+  cv:      join(DATA_ROOT, 'cv.md'),
+  profile: join(DATA_ROOT, 'modes', '_profile.md'),
+  profileYml: join(DATA_ROOT, 'config', 'profile.yml'),
+  reports: join(DATA_ROOT, 'reports'),
+  // CAREER_OPS_ADDITIONS mirrors merge-tracker.mjs:43. Writing under DATA_ROOT
+  // regardless would drop the addition somewhere the merge it instructs never
+  // looks, so the evaluation would sit there unread.
+  trackerAdditions: process.env.CAREER_OPS_ADDITIONS
+    ? process.env.CAREER_OPS_ADDITIONS
+    : join(DATA_ROOT, 'batch', 'tracker-additions'),
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +90,8 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     --file <path>    Read JD from a file instead of inline text
     --model <name>   Ollama model to use (default: llama3.3)
     --url <url>      Ollama base URL (default: http://localhost:11434)
+    --posting-url <url>  Posting URL, recorded in the report header and
+                     used as the tracker's dedup key
     --no-save        Do not save report to reports/ directory
     --help           Show this help
 
@@ -84,8 +111,17 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
 
 // Parse flags
 let jdText    = '';
+let postingUrl = '';
 let modelName = process.env.OLLAMA_MODEL || 'llama3.3';
 let baseUrl   = (process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/$/, '');
+// Context window for the request AND the prompt budget. Defaults to the previous hardcoded
+// 32768, so behaviour is unchanged unless OLLAMA_NUM_CTX is set. Raise it for a model with a
+// bigger window; `ollama show` reports each model's ceiling (qwen2.5 caps at 32768).
+const numCtx = parseInt(process.env.OLLAMA_NUM_CTX || '32768', 10);
+if (Number.isNaN(numCtx) || numCtx <= 0) {
+  console.error(`❌  Invalid OLLAMA_NUM_CTX: "${process.env.OLLAMA_NUM_CTX}" — must be a positive integer (tokens).`);
+  process.exit(1);
+}
 let saveReport = true;
 
 for (let i = 0; i < args.length; i++) {
@@ -106,6 +142,8 @@ for (let i = 0; i < args.length; i++) {
     modelName = args[++i];
   } else if (args[i] === '--url' && args[i + 1]) {
     baseUrl = args[++i].replace(/\/$/, '');
+  } else if (args[i] === '--posting-url' && args[i + 1]) {
+    postingUrl = args[++i];
   } else if (args[i] === '--no-save') {
     saveReport = false;
   } else if (!args[i].startsWith('--')) {
@@ -115,6 +153,17 @@ for (let i = 0; i < args.length; i++) {
 
 if (!jdText) {
   console.error('❌  No Job Description provided. Run with --help for usage.');
+  process.exit(1);
+}
+
+// A posting URL is the tracker's deterministic dedup key, so it is taken only in
+// a form that can actually become one. Parsed, not prefix-matched: `https://`
+// satisfies a prefix test and merge-tracker.mjs:697 would then classify it as
+// the URL extra, but normalizeUrl yields no key for it -- so it would sit in the
+// URL column looking like a key while deduping nothing. A placeholder written
+// there would be worse still, handing every such row the same key.
+if (postingUrl && !isPostingUrl(postingUrl)) {
+  console.error(`❌  --posting-url must be a complete http(s) URL: "${postingUrl}"`);
   process.exit(1);
 }
 
@@ -134,22 +183,6 @@ function readFile(path, label) {
     return `[${label} not found — skipping]`;
   }
   return readFileSync(path, 'utf-8').trim();
-}
-
-/**
- * Determine the next zero-padded report number based on existing files in reports/.
- * Scans for files whose name starts with one or more digits followed by a hyphen,
- * then returns max + 1 padded to at least 3 digits. Supports report counts above 999
- * without resetting or colliding (avoids the fixed-3-digit slice assumption).
- * @returns {string} Zero-padded report number string, e.g. "042" or "1001".
- */
-function nextReportNumber() {
-  if (!existsSync(PATHS.reports)) return '001';
-  const files = readdirSync(PATHS.reports)
-    .map(f => { const m = f.match(/^(\d+)-/); return m ? parseInt(m[1], 10) : NaN; })
-    .filter(n => !isNaN(n));
-  if (files.length === 0) return '001';
-  return String(Math.max(...files) + 1).padStart(3, '0');
 }
 
 // ---------------------------------------------------------------------------
@@ -205,29 +238,41 @@ console.log('\n📂  Loading context files...');
 const sharedContext = readFile(PATHS.shared, 'modes/_shared.md');
 const ofertaLogic   = readFile(PATHS.oferta, 'modes/oferta.md');
 const cvContent     = readFile(PATHS.cv,     'cv.md');
+const profileContent = readFile(PATHS.profile, 'modes/_profile.md');
+const profileYml    = readFile(PATHS.profileYml, 'config/profile.yml');
+const languageInstruction = outputLanguageInstruction(parseOutputLanguage(profileYml));
 
 // ---------------------------------------------------------------------------
-// Build system prompt
+// Build system prompt with token budget management
 // ---------------------------------------------------------------------------
+const { contextBody, budgetReport } = buildBudgetedPrompt({
+  sharedContent: sharedContext,
+  ofertaContent: ofertaLogic,
+  cvContent,
+  profileYml,
+  profileContent,
+  jdText,
+  maxTokens: numCtx, // matches options.num_ctx below
+});
+
+if (budgetReport.compressed) {
+  console.log(`📊  Token budget: ${budgetReport.beforeTokens} → ${budgetReport.afterTokens} tokens (saved ${budgetReport.beforeTokens - budgetReport.afterTokens})`);
+  console.log(`    Trimmed sections: ${budgetReport.removed.join(', ')}`);
+  if (budgetReport.overBudget) {
+    console.log(`    ⚠️  Still ${budgetReport.afterTokens - budgetReport.budget} tokens over budget after compression`);
+  }
+} else if (budgetReport.overBudget) {
+  console.log(`⚠️  Token budget: ${budgetReport.totalTokens} tokens exceeds ${budgetReport.budget} limit by ${budgetReport.totalTokens - budgetReport.budget}`);
+} else {
+  console.log(`📊  Token budget: ${budgetReport.totalTokens} tokens (within ${budgetReport.budget} limit)`);
+}
+
 const systemPrompt = `You are career-ops, an AI-powered job search assistant.
 You evaluate job offers against the user's CV using a structured A-G scoring system.
 
 Your evaluation methodology is defined below. Follow it exactly.
 
-═══════════════════════════════════════════════════════
-SYSTEM CONTEXT (_shared.md)
-═══════════════════════════════════════════════════════
-${sharedContext}
-
-═══════════════════════════════════════════════════════
-EVALUATION MODE (oferta.md)
-═══════════════════════════════════════════════════════
-${ofertaLogic}
-
-═══════════════════════════════════════════════════════
-CANDIDATE RESUME (cv.md)
-═══════════════════════════════════════════════════════
-${cvContent}
+${contextBody}
 
 ═══════════════════════════════════════════════════════
 IMPORTANT OPERATING RULES FOR THIS SESSION
@@ -236,8 +281,9 @@ IMPORTANT OPERATING RULES FOR THIS SESSION
    - Block D (Comp research): use training-data salary estimates; note them as estimates.
    - Block G (Legitimacy): analyze JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
-2. Generate Blocks A through G in full.
-3. At the very end, output this exact machine-readable block:
+2. ${languageInstruction}
+3. Generate Blocks A through G in full.
+4. At the very end, output this exact machine-readable block:
 
 ---SCORE_SUMMARY---
 COMPANY: <company name or "Unknown">
@@ -251,7 +297,7 @@ LEGITIMACY: <High Confidence | Proceed with Caution | Suspicious>
 // ---------------------------------------------------------------------------
 // Call Ollama
 // ---------------------------------------------------------------------------
-const endpoint = `${baseUrl}/v1/chat/completions`;
+const endpoint = `${baseUrl}/api/chat`;
 const timeoutMs = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
 if (Number.isNaN(timeoutMs) || timeoutMs <= 0) {
   console.error(`❌  Invalid OLLAMA_TIMEOUT_MS: "${process.env.OLLAMA_TIMEOUT_MS}" — must be a positive integer (milliseconds).`);
@@ -271,9 +317,18 @@ try {
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: `JOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
       ],
-      stream:      false,
-      temperature: 0.4,
-      options: { num_ctx: 32768 },
+      // stream:true so response headers arrive with the FIRST token. With stream:false
+      // Ollama sends nothing until the whole report is generated, and Node's undici client
+      // gives up at its own 300s headersTimeout — a deadline neither OLLAMA_TIMEOUT_MS nor
+      // AbortSignal.timeout controls, which surfaced as a bare "fetch failed" at 5:01.
+      stream: true,
+      // Ollama's native /api/chat reads generation params from `options` only.
+      // This call targets that endpoint (NOT the OpenAI-compatible /v1 route,
+      // which ignores `options` and has no num_ctx equivalent), so both the
+      // deterministic temperature and the enlarged context window actually take
+      // effect. Without num_ctx here Ollama defaults to a 2048-token context and
+      // silently truncates the prompt; without temperature it runs at 0.8.
+      options: { temperature: 0.4, num_ctx: numCtx },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -285,8 +340,56 @@ try {
     process.exit(1);
   }
 
-  const data = await res.json();
-  evaluationText = data.choices?.[0]?.message?.content?.trim();
+  // Streamed /api/chat is newline-delimited JSON: one object per token, the last carrying
+  // done:true and the token counts.
+  let acc = '', buf = '', promptCount = 0, evalCount = 0;
+  const decoder = new TextDecoder();
+  for await (const chunk of res.body) {
+    buf += decoder.decode(chunk, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+      if (obj.error) {
+        console.error(`❌  Ollama error: ${obj.error}`);
+        process.exit(1);
+      }
+      if (obj.message?.content) acc += obj.message.content;
+      if (obj.done) {
+        promptCount = obj.prompt_eval_count ?? 0;
+        evalCount = obj.eval_count ?? 0;
+      }
+    }
+  }
+  // Flush a final line that arrived without a trailing newline. Ollama terminates every
+  // chunk with one, but a body that ends mid-line would otherwise be dropped silently.
+  const tail = buf.trim();
+  if (tail) {
+    try {
+      const obj = JSON.parse(tail);
+      if (obj.error) {
+        console.error(`❌  Ollama error: ${obj.error}`);
+        process.exit(1);
+      }
+      if (obj.message?.content) acc += obj.message.content;
+      if (obj.done) {
+        promptCount = obj.prompt_eval_count ?? promptCount;
+        evalCount = obj.eval_count ?? evalCount;
+      }
+    } catch { /* a truncated final line is not recoverable; the empty-response check below reports it */ }
+  }
+  evaluationText = acc.trim();
+  // Native /api/chat reports tokens as prompt_eval_count / eval_count, not an
+  // OpenAI-shaped `usage` object; map them through the shared normalizer.
+  const usage = normalizeOpenAIUsage({
+    prompt_tokens: promptCount,
+    completion_tokens: evalCount,
+    total_tokens: promptCount + evalCount,
+  });
+  tracker.record('evaluation', usage);
   if (!evaluationText) {
     console.error('❌  Ollama returned an empty response.');
     process.exit(1);
@@ -336,14 +439,26 @@ if (summaryMatch) {
 // Save report
 // ---------------------------------------------------------------------------
 if (saveReport) {
+  let reservedNumbers = [];
   try {
     if (!existsSync(PATHS.reports)) {
       mkdirSync(PATHS.reports, { recursive: true });
     }
 
-    const num         = nextReportNumber();
-    const today       = new Date().toISOString().split('T')[0];
-    const companySlug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    reservedNumbers   = await reserveReportNumbers(1, { rootDir: ROOT, reportsDir: PATHS.reports });
+    const num         = formatReportNumber(reservedNumbers[0]);
+    // LOCAL calendar day (#3070). This one value becomes three things that have to
+    // agree with each other and with the user's calendar: the report FILENAME
+    // ({num}-{slug}-{today}.md), the report's own `**Date:**` header, and the date
+    // column of the tracker row written for it.
+    //
+    // On the UTC day an evaluation run on a Sunday evening in the Americas produces
+    // 042-acme-2026-08-18.md, dated the 18th, in a tracker row dated the 18th —
+    // while every other date the user sees, and every date the other scripts now
+    // stamp, says the 17th. The filename is the part that cannot be corrected
+    // later: reports are addressed by it.
+    const today       = localToday();
+    const companySlug = slugifyCompany(company);
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);
 
@@ -352,6 +467,7 @@ if (saveReport) {
 **Date:** ${today}
 **Archetype:** ${archetype}
 **Score:** ${score}/5
+**URL:** ${postingUrl || '(pasted)'}
 **Legitimacy:** ${legitimacy}
 **PDF:** pending
 **Tool:** Ollama (${modelName})
@@ -364,13 +480,56 @@ ${evaluationText.replace(/---SCORE_SUMMARY---[\s\S]*?---END_SUMMARY---/, '').tri
     writeFileSync(reportPath, reportContent, 'utf-8');
     console.log(`\n✅  Report saved: reports/${filename}`);
 
-    console.log(`\n📊  Tracker entry (add to data/applications.md):`);
-    console.log(`    | ${num} | ${today} | ${company} | ${role} | ${score}/5 | Evaluated | ❌ | [${num}](reports/${filename}) |`);
+    // AGENTS.md Pipeline Integrity rule 1: never hand the user a row to paste
+    // into data/applications.md. Evaluations persist as a tracker addition and
+    // merge-tracker.mjs applies dedup, status validation, report-link
+    // normalization and the tracker lock. A pasted literal skipped all of that,
+    // and at 8 cells it was also silently dropped by every reader's width guard.
+    // Field order is the TSV contract's -- status BEFORE score; merge-tracker
+    // swaps them into the tracker's own column order, resolved by name.
+    const additionName = `${num}-${companySlug}.tsv`;
+    const trackerFields = [
+      String(parseInt(num, 10)),
+      today,
+      tsvSafe(company),
+      tsvSafe(role),
+      'Evaluated',
+      normalizedTrackerScore(score),
+      '❌',
+      `[${num}](reports/${filename})`,
+      tsvSafe(`Ollama evaluation (${modelName})`),
+    ];
+    // Optional tenth field, labelled in the header below so it resolves by name.
+    // Pass 0 can then match on it instead of waiting for --backfill-urls.
+    if (postingUrl) trackerFields.push(tsvSafe(postingUrl));
+    // Header row first (#3517/#3706): merge-tracker resolves the fields by name,
+    // so this row cannot be ingested into the wrong columns. The optional URL
+    // needs its own label -- values are read BY label, so a tenth field the
+    // header does not name is not mis-mapped, it is dropped.
+    const additionHeader = postingUrl ? `${TSV_ADDITION_HEADER}\turl` : TSV_ADDITION_HEADER;
+    mkdirSync(PATHS.trackerAdditions, { recursive: true });
+    writeFileSync(
+      join(PATHS.trackerAdditions, additionName),
+      `${additionHeader}\n${trackerFields.join('\t')}\n`,
+      'utf-8',
+    );
+    console.log(`\n📊  Tracker addition saved: batch/tracker-additions/${additionName}`);
+    console.log('    Run `node merge-tracker.mjs` to merge it into the tracker.');
   } catch (err) {
     console.warn(`⚠️   Could not save report: ${err.message}`);
+  } finally {
+    if (reservedNumbers.length > 0) {
+      try {
+        await releaseReportNumbers(reservedNumbers, { reportsDir: PATHS.reports });
+      } catch (err) {
+        console.warn(`⚠️   Could not release report reservation: ${err.message}`);
+      }
+    }
   }
 }
 
 console.log('\n' + '─'.repeat(66));
 console.log(`  Score: ${score}/5  |  Archetype: ${archetype}  |  Legitimacy: ${legitimacy}`);
 console.log('─'.repeat(66) + '\n');
+
+console.log(formatBreakdown(tracker, modelName, 'ollama'));

@@ -19,20 +19,24 @@
 import path from 'path';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 import {
   discoverPlugins, pluginRoots, loadPluginConfig, pluginStatus,
-  runHook, loadDotenvOnce, HOOK_KINDS, loadSkill, resolveSuccessorIds,
+  runHook, filterResultsForId, loadDotenvOnce, HOOK_KINDS, loadSkill, resolveSuccessorIds,
+  warnConfigLeftInCodeRoot,
 } from './plugins/_engine.mjs';
 import { loadRegistry, findInRegistry, classifySource, sourceBadge, successorFor } from './plugins/_registry.mjs';
 import { readLock, writeLockEntry, removeLockEntry, hashPluginTree, consentSurface } from './plugins/_lock.mjs';
 import { installFromRepo, scaffoldNew, parseRepoArg } from './plugin-install.mjs';
 import { appendToPipeline } from './scan.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const APPLICATIONS_PATH = path.join(ROOT, 'data', 'applications.md');
-const PIPELINE_PATH = path.join(ROOT, 'data', 'pipeline.md');
+const DATA_ROOT = getCareerOpsRoot();
+const APPLICATIONS_PATH = path.join(DATA_ROOT, 'data', 'applications.md');
+const PIPELINE_PATH = path.join(DATA_ROOT, 'data', 'pipeline.md');
 
 // A misbehaving plugin's stray rejection should be attributed and not silently
 // crash the host (the engine's per-hook try/catch handles the common case; this
@@ -84,8 +88,12 @@ function existingPipelineUrls() {
 function buildSnapshot() {
   const applications = existsSync(APPLICATIONS_PATH)
     ? parseMarkdownTable(readFileSync(APPLICATIONS_PATH, 'utf8')) : [];
+  // pipeline.md uses a checklist format (`- [ ] url`), not a markdown table —
+  // parseMarkdownTable would always return [] here.
   const pipeline = existsSync(PIPELINE_PATH)
-    ? parseMarkdownTable(readFileSync(PIPELINE_PATH, 'utf8')) : [];
+    ? [...readFileSync(PIPELINE_PATH, 'utf8').matchAll(/- \[[ xX]\]\s+(\S+)/g)]
+        .map(m => Object.freeze({ url: m[1] }))
+    : [];
   return Object.freeze({
     applications: Object.freeze(applications),
     pipeline: Object.freeze(pipeline),
@@ -93,7 +101,9 @@ function buildSnapshot() {
 }
 
 async function cmdList() {
-  const cfg = await loadPluginConfig(ROOT);
+  warnConfigLeftInCodeRoot(ROOT, DATA_ROOT);
+  const cfg = await loadPluginConfig(DATA_ROOT);
+  await loadDotenvOnce(DATA_ROOT);
   const overridden = resolveSuccessorIds(ROOT); // ids where an installed successor is active
   const manifests = discoverPlugins(pluginRoots(ROOT), overridden);
   if (manifests.length === 0) {
@@ -124,7 +134,8 @@ async function cmdRun(args) {
   const id = positional[0];
   if (!id) { console.error('Usage: node plugins.mjs run <id> [hook] [args…] [--dry-run]'); process.exit(1); }
 
-  const cfg = await loadPluginConfig(ROOT);
+  warnConfigLeftInCodeRoot(ROOT, DATA_ROOT);
+  const cfg = await loadPluginConfig(DATA_ROOT);
   const manifest = discoverPlugins(pluginRoots(ROOT), resolveSuccessorIds(ROOT)).find(m => m.id === id);
   if (!manifest) { console.error(`Unknown plugin "${id}". Run \`node plugins.mjs list\`.`); process.exit(1); }
 
@@ -144,17 +155,19 @@ async function cmdRun(args) {
   }
   if (!manifest.hooks.includes(hook)) { console.error(`Plugin "${id}" does not expose a "${hook}" hook (has: ${manifest.hooks.join(', ')}).`); process.exit(1); }
 
+  // The user-layer .env belongs beside config/plugins.yml under DATA_ROOT.
+  // Load it before the gate so a configured key is not reported as missing.
+  await loadDotenvOnce(DATA_ROOT);
+
   // Two-gate check with an actionable message before doing any work.
   const status = pluginStatus(manifest, cfg);
   if (!status.configured) { console.error(`Plugin "${id}" is not enabled. Set plugins.${id}.enabled: true in config/plugins.yml.`); process.exit(1); }
   if (status.missingEnv.length) { console.error(`Plugin "${id}" is missing ${status.missingEnv.join(', ')} in .env. See .env.example.`); process.exit(1); }
 
-  await loadDotenvOnce();
-
   if (hook === 'ingest' || hook === 'search') {
     const payload = hook === 'search' ? positional.slice(hookArgStart).join(' ') : undefined;
     if (hook === 'search' && !payload) { console.error(`search needs a query: node plugins.mjs run ${id} search "<query>"`); process.exit(1); }
-    const results = await runHook(hook, payload, { root: ROOT, dryRun });
+    const results = filterResultsForId(await runHook(hook, payload, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
     const found = results.filter(r => r.ok && Array.isArray(r.result)).flatMap(r => r.result).map(sanitizeJob).filter(Boolean);
     // Additive de-dup: never re-add a URL already in the pipeline.
     const known = existingPipelineUrls();
@@ -162,13 +175,18 @@ async function cmdRun(args) {
     const jobs = found.filter(j => !known.has(j.url) && !seen.has(j.url) && seen.add(j.url));
     console.log(`${id} ${hook}: ${found.length} found, ${jobs.length} new.`);
     if (dryRun) { jobs.slice(0, 20).forEach(j => console.log(`  • ${j.title} — ${j.url}`)); console.log('(--dry-run: pipeline not written)'); return; }
-    if (jobs.length) { appendToPipeline(jobs); console.log(`→ Appended ${jobs.length} to data/pipeline.md. Run /career-ops pipeline to evaluate.`); }
+    if (jobs.length) { await appendToPipeline(jobs); console.log(`→ Appended ${jobs.length} to data/pipeline.md. Run /career-ops pipeline to evaluate.`); }
     return;
   }
 
   if (hook === 'export') {
     const snapshot = buildSnapshot();
-    const results = await runHook('export', snapshot, { root: ROOT, dryRun });
+    // Export upserts one-by-one over the network (query + create/update per
+    // row), so the default 15s hook timeout only covers a handful of rows.
+    // Scale with tracker size so a growing applications.md doesn't age out.
+    const rowCount = snapshot.applications.length;
+    const timeoutMs = Math.min(120_000, Math.max(15_000, rowCount * 3_000));
+    const results = filterResultsForId(await runHook('export', snapshot, { root: ROOT, dataRoot: DATA_ROOT, dryRun, timeoutMs, pluginId: id }), id);
     for (const r of results) {
       if (r.ok) console.log(`${r.id} export: pushed ${r.result?.pushed ?? 0} record(s).`);
       else console.log(`${r.id} export: failed — ${r.error}`);
@@ -178,7 +196,7 @@ async function cmdRun(args) {
 
   if (hook === 'notify') {
     const message = positional.slice(hookArgStart).join(' ') || '(career-ops notification)';
-    const results = await runHook('notify', { message }, { root: ROOT, dryRun });
+    const results = filterResultsForId(await runHook('notify', { message }, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
     for (const r of results) console.log(r.ok ? `${r.id} notify: sent.` : `${r.id} notify: failed — ${r.error}`);
     return;
   }
@@ -188,18 +206,74 @@ function findManifest(id) {
   return discoverPlugins(pluginRoots(ROOT), resolveSuccessorIds(ROOT)).find(m => m.id === id) || null;
 }
 
+/**
+ * Parse an existing config/plugins.yml into the object setEnabled merges into.
+ *
+ * Split out and exported so the guard below is testable without driving the CLI
+ * at a real config file.
+ *
+ * THROWS rather than returning {} when the file will not parse. setEnabled's
+ * contract is "merging (never clobbering the user's other plugins or non-secret
+ * settings)", and a merge is only a merge if the read succeeded: a swallowed
+ * parse error left cfg as {}, and the write put that empty object back over the
+ * file. Every other plugin's enabled state and settings went with it, including
+ * any non-secret value stored there, and nothing was printed.
+ *
+ * The trigger is a YAML typo — the most likely reason a hand-edited config does
+ * not parse, and precisely when the file is most in need of not being replaced.
+ * config/plugins.yml is a USER path in update-system.mjs, so there is no copy to
+ * restore from.
+ *
+ * @param {string|null} raw - File contents, or null when the file does not exist.
+ * @param {string} file - Path, for the error message only.
+ * @returns {object} Parsed config; {} for an absent file.
+ */
+export function parsePluginConfig(raw, file) {
+  // Absent is not unreadable: no file means a first enable, which is the whole
+  // point of the function. Only an existing-but-unparseable file is a refusal.
+  if (raw == null) return {};
+  // An empty or comment-only file is "no config yet", not a corrupt one, and it
+  // must take the same path as an absent one. Decided from the text rather than
+  // from what the parser does with it: js-yaml 4 returns undefined for an empty
+  // document and js-yaml 5 throws "expected a document, but the input is empty",
+  // so inferring it from the parser would make this refuse to write over a
+  // comment-only config on one major and not the other.
+  const hasContent = raw.split('\n').some((line) => {
+    const t = line.trim();
+    return t !== '' && !t.startsWith('#');
+  });
+  if (!hasContent) return {};
+  let cfg;
+  try {
+    cfg = yaml.load(raw);
+  } catch (err) {
+    throw new Error(
+      `${file} is not valid YAML (${String(err.message).split('\n')[0]}) — refusing to overwrite it. `
+      + 'Fix the file and re-run; nothing was changed.',
+    );
+  }
+  if (cfg == null) return {};   // empty file: same as absent
+  // A scalar or a list parses cleanly and is still not a config. Spreading one
+  // below would discard it just as silently as the empty object did.
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new Error(`${file} does not contain a YAML mapping — refusing to overwrite it. Nothing was changed.`);
+  }
+  return cfg;
+}
+
 // Write enabled:true/false into config/plugins.yml, merging (never clobbering
 // the user's other plugins or non-secret settings).
-function setEnabled(id, on, settings) {
-  const file = path.join(ROOT, 'config', 'plugins.yml');
-  let cfg = {};
-  if (existsSync(file)) { try { cfg = yaml.load(readFileSync(file, 'utf8')) || {}; } catch {} }
+export function setPluginEnabled(root, id, on, settings) {
+  const file = path.join(root, 'config', 'plugins.yml');
+  const cfg = parsePluginConfig(existsSync(file) ? readFileSync(file, 'utf8') : null, file);
   if (!cfg.plugins || typeof cfg.plugins !== 'object') cfg.plugins = {};
   const prev = (cfg.plugins[id] && typeof cfg.plugins[id] === 'object') ? cfg.plugins[id] : {};
   cfg.plugins[id] = { ...prev, ...(settings || {}), enabled: on };
-  mkdirSync(path.join(ROOT, 'config'), { recursive: true });
+  mkdirSync(path.join(root, 'config'), { recursive: true });
   writeFileSync(file, '# career-ops plugin activation — see config/plugins.example.yml\n' + yaml.dump(cfg), 'utf8');
 }
+
+const setEnabled = (id, on, settings) => setPluginEnabled(DATA_ROOT, id, on, settings);
 
 // The capability card a user must consent to before a plugin runs.
 function capabilityCard(manifest, source) {
@@ -292,8 +366,19 @@ function cmdRemove(args) {
   const dir = path.join(ROOT, 'plugins.local', id);
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
   removeLockEntry(ROOT, id);
-  try { setEnabled(id, false); } catch {}
-  console.log(`✓ Removed ${id} (plugins.local + lock + disabled).`);
+  // The files and the lock entry are already gone, so a config problem must not
+  // fail the command — but it must not be invisible either. This catch used to
+  // swallow nothing worth seeing; now it can catch a real, actionable one, and
+  // a user told "disabled" while the config still says enabled: true has been
+  // told the wrong thing.
+  let disabled = true;
+  try {
+    setEnabled(id, false);
+  } catch (err) {
+    disabled = false;
+    console.error(`⚠ ${id} was removed, but config/plugins.yml could not be updated: ${err.message}`);
+  }
+  console.log(`✓ Removed ${id} (plugins.local + lock${disabled ? ' + disabled' : ''}).`);
 }
 
 function cmdNew(args) {
@@ -361,6 +446,10 @@ async function main() {
   }
 }
 
-if (import.meta.url === (await import('url')).pathToFileURL(process.argv[1] || '').href) {
+// Named exports for the test suite — not part of the CLI API.
+export const _testPaths = Object.freeze({ APPLICATIONS_PATH, PIPELINE_PATH });
+export { buildSnapshot as _testBuildSnapshot };
+
+if (isMainModule(import.meta.url)) {
   main().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
 }
